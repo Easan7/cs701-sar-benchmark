@@ -28,7 +28,12 @@ def detection_metrics(gt_json, predictions, image_ids):
     """COCO box AP of `predictions` (dicts with image_id, category_id, bbox [x, y, w, h] in original
     pixels, score) against the ground truth in `gt_json`, evaluated on the images `image_ids` only."""
     with contextlib.redirect_stdout(io.StringIO()):  # silence pycocotools; the caller prints its own summary
-        gt = COCO(gt_json)
+        if isinstance(gt_json, dict):
+            gt = COCO()
+            gt.dataset = gt_json
+            gt.createIndex()
+        else:
+            gt = COCO(gt_json)
         # loadRes adds keys to the dicts it is given, so it gets copies; it cannot load an empty list
         dt = gt.loadRes([dict(p) for p in predictions]) if predictions else COCO()
         ev = COCOeval(gt, dt, 'bbox')

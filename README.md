@@ -90,17 +90,37 @@ bash run_all.sh                                                  # all eight run
 
 ### 2.3 Use Course Data
 
-TA Zichen ran this code on fully labelled data in another folder layout. For the
-[course data](https://huggingface.co/datasets/doem1997/cs701-sar-course-data), adapt `sarbench/data.py` and `train.py`:
+Download and unpack the released training archive in the repository root:
 
-- train on `train/labels.csv` + `train/instances.json`
-- hold out part of train for local validation (val and test have no labels)
-- predict on the images in `val/images.json` and `test/images.json`
+```bash
+pip install -U huggingface_hub
+hf download doem1997/cs701-sar-course-data --repo-type dataset --local-dir cs701-sar-course-data
+cd cs701-sar-course-data && tar -xzf train.tar.gz && cd ..
+```
+
+The loader reads `cs701-sar-course-data/train/labels.csv` and
+`cs701-sar-course-data/train/instances.json`. Training holds out a deterministic,
+class-stratified 10% of labeled train data for local validation. Course val and
+test labels are withheld, so they are never used for scoring during training.
+Override the holdout with `--val-fraction 0.15`, for example. Run one model with:
+
+```bash
+python train.py --data cs701-sar-course-data --backbone vit --init pretrained --adapt lora
+```
+
+Use `--limit 64 --epochs 1 --workers 0 --out runs/smoke` for a quick data/model
+path check. This is only a smoke run; for useful validation, train on the full
+training archive. `run_all.sh` still launches eight long reference experiments.
+
+After the val or test release, download again and unpack its archive in the same
+folder. Those releases contain prediction images/manifests only; a separate
+inference and submission step must use `val/images.json` or `test/images.json`.
 
 ### 2.4 Make Submission
 
 `make_submission.py` has `write_submission` (the function in the briefing video): maps your boxes back to
-original image pixels, writes `submission.zip` for Codabench.
+original image pixels, writes `submission.zip` for Codabench. Inference on the
+unlabeled course val/test images is a separate step from `train.py`.
 
 ## 3. Baseline Results (for reference)
 

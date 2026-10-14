@@ -1,3 +1,5 @@
 runs/
+.venv/
+cs701-sar-course-data/
 __pycache__/
 .pytest_cache/

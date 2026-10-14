@@ -3,6 +3,7 @@ Example: python train.py --backbone vit --init pretrained --adapt lora"""
 import argparse
 import json
 import math
+import random
 import time
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from sarbench.model import MultiTaskModel
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--data', type=Path, default=Path(__file__).resolve().parents[1] / 'dataset' / 'SARFact-Course-20K')
+    p.add_argument('--data', type=Path, default=Path(__file__).resolve().parent / 'cs701-sar-course-data')
     p.add_argument('--backbone', required=True, choices=['vit', 'terramind'])
     p.add_argument('--init', required=True, choices=['pretrained', 'scratch'])
     p.add_argument('--adapt', required=True, choices=['full', 'lora', 'moelora'])
@@ -31,6 +32,7 @@ def parse_args():
     p.add_argument('--eval-every', type=int, default=4, help='validate every N epochs, and after the last one')
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--limit', type=int, help='use only the first N images of every split (quick checks)')
+    p.add_argument('--val-fraction', type=float, default=0.1, help='fraction of labeled train images held out locally')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--out', type=Path, default=Path('runs'))
     args = p.parse_args()
@@ -47,10 +49,9 @@ def log(message, file):
     print(message, file=file, flush=True)
 
 
-def make_loader(args, split):
-    """Batches of `split`; only the training set is shuffled and augmented."""
-    train = split == 'train'
-    dataset = SARMultiTask(args.data, split, train=train, limit=args.limit)
+def make_loader(args, indices, train):
+    """Batches from labeled train; only the training subset is shuffled and augmented."""
+    dataset = SARMultiTask(args.data, 'train', train=train, limit=args.limit, indices=indices)
     return DataLoader(dataset, args.batch_size, shuffle=train, num_workers=args.workers, collate_fn=collate,
                       persistent_workers=train and args.workers > 0)  # training workers live across epochs
 
@@ -109,14 +110,32 @@ def headline(metrics):
 
 def main():
     args = parse_args()
+    if not 0 < args.val_fraction < 1:
+        raise ValueError('--val-fraction must be between 0 and 1')
     torch.manual_seed(args.seed)
     run_dir = args.out / f'{args.backbone}_{args.init}_{args.adapt}'
     run_dir.mkdir(parents=True, exist_ok=True)
     log_file = open(run_dir / 'log.txt', 'w')
     log(json.dumps(vars(args), default=str), log_file)
 
-    # Data
-    train_loader, val_loader, test_loader = (make_loader(args, split) for split in ('train', 'val', 'test'))
+    # Course val/test labels are withheld. Make a deterministic, class-stratified holdout from train.
+    all_data = SARMultiTask(args.data, 'train', limit=args.limit)
+    by_class = {}
+    for i, row in enumerate(all_data.rows):
+        by_class.setdefault(int(row['label']), []).append(i)
+    rng = random.Random(args.seed)
+    train_indices, val_indices = [], []
+    for indices in by_class.values():
+        rng.shuffle(indices)
+        n_val = max(1, round(len(indices) * args.val_fraction)) if len(indices) > 1 else 0
+        val_indices.extend(indices[:n_val])
+        train_indices.extend(indices[n_val:])
+    train_loader = make_loader(args, train_indices, True)
+    val_loader = make_loader(args, val_indices, False)
+    val_rows = [all_data.rows[i] for i in val_indices]
+    val_ids = {all_data.coco_images[row['file_name']]['id'] for row in val_rows}
+    val_gt = {**all_data.coco, 'images': [im for im in all_data.coco['images'] if im['id'] in val_ids],
+              'annotations': [a for a in all_data.coco['annotations'] if a['image_id'] in val_ids]}
 
     # Model: adapters are created on the CPU, so they are added before .cuda()
     backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained')
@@ -140,23 +159,20 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_one_epoch(model, train_loader, optimizer, schedule, epoch, log_file)
         if epoch % args.eval_every == 0 or epoch == args.epochs:
-            val, val_detections = evaluate(model, val_loader, args.data / 'detection' / 'instances_val.json')
+            val, val_detections = evaluate(model, val_loader, val_gt)
             history.append({'epoch': epoch, **val})
             log(f'epoch {epoch} val: {headline(val)}', log_file)
     train_hours = (time.time() - start) / 3600
 
-    # Evaluate on test, once
-    test, test_detections = evaluate(model, test_loader, args.data / 'detection' / 'instances_test.json')
     peak_gb = torch.cuda.max_memory_allocated() / 2**30
-    log(f'test: {headline(test)}\ntraining {train_hours:.2f} h, peak GPU memory {peak_gb:.1f} GB', log_file)
+    log(f'training {train_hours:.2f} h, peak GPU memory {peak_gb:.1f} GB', log_file)
 
     # Save
     summary = {'args': vars(args), 'parameters': parameters, 'trainable_parameters': trainable,
                'train_hours': train_hours, 'peak_gpu_memory_gb': peak_gb,
-               'val_history': history, 'val': history[-1], 'test': test}
+               'val_history': history, 'val': history[-1]}
     (run_dir / 'metrics.json').write_text(json.dumps(summary, indent=2, default=str))
     (run_dir / 'predictions_val.json').write_text(json.dumps(val_detections))
-    (run_dir / 'predictions_test.json').write_text(json.dumps(test_detections))
     torch.save(model.state_dict(), run_dir / 'model.pt')
 
 
