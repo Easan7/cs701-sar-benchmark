@@ -1,4 +1,4 @@
-"""Train one model jointly for classification and detection, then score it on val and test.
+"""Train one model jointly for classification and detection, validating on a holdout from labeled train data.
 Example: python train.py --backbone vit --init pretrained --adapt lora"""
 import argparse
 import json
@@ -31,7 +31,7 @@ def parse_args():
     p.add_argument('--weight-decay', type=float, default=0.05)
     p.add_argument('--eval-every', type=int, default=4, help='validate every N epochs, and after the last one')
     p.add_argument('--workers', type=int, default=8)
-    p.add_argument('--limit', type=int, help='use only the first N images of every split (quick checks)')
+    p.add_argument('--limit', type=int, help='use only the first N labeled training images (quick checks)')
     p.add_argument('--val-fraction', type=float, default=0.1, help='fraction of labeled train images held out locally')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--out', type=Path, default=Path('runs'))

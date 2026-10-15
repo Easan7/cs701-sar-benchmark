@@ -53,7 +53,7 @@ class SARMultiTask(Dataset):
 
     def __getitem__(self, i):
         row = self.rows[i]
-        info = self.coco_images[row['image']]
+        info = self.coco_images[row['file_name']]
         anns = self.annotations[info['id']]
         orig_size = (info['height'], info['width'])
         boxes = tv_tensors.BoundingBoxes([a['bbox'] for a in anns], format='XYWH', canvas_size=orig_size,
