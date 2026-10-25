@@ -1,5 +1,32 @@
-runs/
+# Local environments and tooling
 .venv/
-cs701-sar-course-data/
+venv/
+env/
 __pycache__/
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# Training, model, and submission artifacts
+runs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+submission*.zip
+
+# Downloaded course data and local scratch files
+cs701-sar-course-data/
+.tmp/
+tmp/
+temp/
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db

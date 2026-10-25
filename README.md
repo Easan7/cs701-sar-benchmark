@@ -21,6 +21,74 @@ image (9 classes) and **detect** its objects.
 4. [Code Structure](#4-code-structure)
 5. [Links](#5-links)
 
+## Run in Google Colab
+
+Colab cannot access files that exist only on your computer. Push the code changes you want to use to your GitHub
+repository first, then clone it in Colab (or upload a ZIP of the current project and unzip it under `/content`).
+
+Use a GPU runtime. The model has 35 M trainable parameters, and 512 px detection can use substantial GPU memory; an
+L4 or A100 is preferable. On a 16 GB T4, lower `--batch-size` to 4 or 2 if you run out of memory. Enable GPU in
+**Runtime → Change runtime type → T4 GPU** (or the strongest GPU available to your account).
+
+Run these cells in a new notebook:
+
+```bash
+!git clone https://github.com/doem97/cs701-sar-benchmark.git
+%cd /content/cs701-sar-benchmark
+!nvidia-smi
+```
+
+Install the pinned project dependencies. This installs the CUDA 12.8 PyTorch wheels specified in
+`requirements.txt`; restart the Colab runtime if prompted, then confirm `torch.cuda.is_available()` is `True`.
+
+```bash
+!pip install -r requirements.txt
+!python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')"
+```
+
+Download and unpack the training archive:
+
+```bash
+!pip install -U huggingface_hub
+!hf download doem1997/cs701-sar-course-data --repo-type dataset --local-dir cs701-sar-course-data
+!tar -xzf cs701-sar-course-data/train.tar.gz -C cs701-sar-course-data
+```
+
+Start with a smoke run, then launch the hybrid training command. Change `--batch-size 16` to `4` or `2` if needed.
+
+```bash
+!python train.py --data cs701-sar-course-data --backbone vit --init pretrained --adapt hybrid \
+  --backbone-lr 2e-5 --lr 1e-4 --select-class-gate --limit 64 --epochs 1 --workers 2 --out runs/smoke
+!python train.py --data cs701-sar-course-data --backbone vit --init pretrained --adapt hybrid \
+  --backbone-lr 2e-5 --lr 1e-4 --select-class-gate --batch-size 16 --workers 2 --out runs
+```
+
+Colab storage is temporary. Copy the best checkpoint to Google Drive before the session ends:
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+```bash
+!mkdir -p /content/drive/MyDrive/cs701-sar
+!cp runs/vit_pretrained_hybrid/best.pt /content/drive/MyDrive/cs701-sar/best.pt
+```
+
+After extracting the released validation or test archive into `cs701-sar-course-data`, predict with the saved
+checkpoint and copy the ZIP to Drive. For example, validation:
+
+```bash
+!tar -xzf cs701-sar-course-data/val.tar.gz -C cs701-sar-course-data
+!python predict.py --checkpoint /content/drive/MyDrive/cs701-sar/best.pt \
+  --data cs701-sar-course-data --split val --out submission_val.zip
+!cp submission_val.zip /content/drive/MyDrive/cs701-sar/submission_val.zip
+```
+
+Use `--split test` and `submission_test.zip` during Phase 2. The `--train-all` option can fit a final model on all
+labeled training images after selecting an epoch count and class gate from the holdout run; save that `final.pt`
+checkpoint to Drive too.
+
 ## 1. SAR Task Introduction
 
 ### 1.1 SAR Basics
@@ -82,9 +150,10 @@ python train.py --backbone vit --init pretrained --adapt lora   # the Δm refere
 bash run_all.sh                                                  # all eight runs, about 7 h
 ```
 
-- Options: `--backbone vit|terramind`, `--init pretrained|scratch`, `--adapt full|lora|moelora`
+- Options: `--backbone vit|terramind`, `--init pretrained|scratch`, `--adapt full|lora|moelora|hybrid`
   (`python train.py -h`).
 - `--adapt full` and `--init scratch` train 106 M parameters: over the 40 M budget, for reference only.
+  They require `--allow-over-budget-reference` to run.
 - Pretrained weights download from Hugging Face on first use (ViT 0.4 GB, TerraMind 1.5 GB).
 - Times for one RTX PRO 6000 Blackwell GPU. Memory: [docs/DETAILS.md](docs/DETAILS.md#time-and-memory).
 
@@ -121,6 +190,42 @@ inference and submission step must use `val/images.json` or `test/images.json`.
 `make_submission.py` has `write_submission` (the function in the briefing video): maps your boxes back to
 original image pixels, writes `submission.zip` for Codabench. Inference on the
 unlabeled course val/test images is a separate step from `train.py`.
+
+### 2.5 Assignment-eligible hybrid run
+
+The `hybrid` method freezes most of the pretrained ViT, applies rank-16 LoRA to attention in its first ten blocks,
+and fully trains its last two blocks and final normalization. Together with the shared classification and detection
+heads, this has **106,891,801 total parameters and 35,027,737 trainable parameters**, within both assignment limits.
+It is a candidate method, not a measured improvement over the reference. It uses one model and one forward pass
+per image. The optional class gate removes detections that disagree with the predicted image class; the local
+training holdout determines whether to use it.
+
+```bash
+python train.py --data cs701-sar-course-data --backbone vit --init pretrained --adapt hybrid \
+  --backbone-lr 2e-5 --lr 1e-4 --select-class-gate --out runs
+```
+
+The script saves the best local-holdout checkpoint as `runs/vit_pretrained_hybrid/best.pt`, selected by the assignment
+metric using validation reference values. The holdout comes only from the labeled training split. After unpacking
+the released validation archive, produce the submission with:
+
+```bash
+python predict.py --checkpoint runs/vit_pretrained_hybrid/best.pt --split val \
+  --out submission_val.zip
+```
+
+Use `--split test` after the test images are released. `predict.py` writes one classification per image and detection
+boxes in original image pixels. The holdout checkpoint uses only 90% of the labeled training data. Once its best
+epoch and class gate are known from `metrics.json`, fit all 9,392 training images for that many epochs and submit
+`runs/vit_pretrained_hybrid_all/final.pt` instead:
+
+```bash
+python train.py --data cs701-sar-course-data --backbone vit --init pretrained --adapt hybrid \
+  --backbone-lr 2e-5 --lr 1e-4 --train-all --epochs BEST_EPOCH --class-gate --out runs
+```
+
+Include `--class-gate` only if the selected holdout checkpoint records `class_gate: true`. The full-data checkpoint
+is not locally scored; use the holdout run for method selection and the full-data run for final predictions.
 
 ## 3. Baseline Results (for reference)
 

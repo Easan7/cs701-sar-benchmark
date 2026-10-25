@@ -42,12 +42,19 @@ class MoELoRA(nn.Module):
 
 
 def add_adapters(backbone, kind):
-    """Freeze the backbone, then wrap attn.qkv and attn.proj of every block (kind: 'lora' or 'moelora')."""
-    adapter = {'lora': LoRA, 'moelora': MoELoRA}[kind]
+    """Adapt attention, or train the last two blocks fully while applying LoRA to earlier blocks."""
+    adapter = {'lora': LoRA, 'moelora': MoELoRA, 'hybrid': LoRA}[kind]
     backbone.requires_grad_(False)
-    for blk in backbone.blocks:
+    blocks = backbone.blocks
+    for blk in blocks[:-2] if kind == 'hybrid' else blocks:
         blk.attn.qkv = adapter(blk.attn.qkv)
         blk.attn.proj = adapter(blk.attn.proj)
+    if kind == 'hybrid':
+        for blk in blocks[-2:]:
+            blk.requires_grad_(True)
+        # The final token normalization also needs to track the changed representations.
+        if hasattr(backbone, 'vit'):
+            backbone.vit.norm.requires_grad_(True)
 
 
 def set_task(module, task):
