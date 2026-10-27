@@ -30,7 +30,7 @@ Use a GPU runtime. The model has 35 M trainable parameters, and 512 px detection
 L4 or A100 is preferable. On a 16 GB T4, lower `--batch-size` to 4 or 2 if you run out of memory. Enable GPU in
 **Runtime → Change runtime type → T4 GPU** (or the strongest GPU available to your account).
 
-Run these cells in a new notebook:
+Run these cells in order in a new notebook. The clone command gets the branch you pushed above:
 
 ```bash
 !git clone https://github.com/doem97/cs701-sar-benchmark.git
@@ -39,14 +39,23 @@ Run these cells in a new notebook:
 ```
 
 Install the pinned project dependencies. This installs the CUDA 12.8 PyTorch wheels specified in
-`requirements.txt`; restart the Colab runtime if prompted, then confirm `torch.cuda.is_available()` is `True`.
+`requirements.txt`. If pip asks to restart the runtime, do so, then rerun the clone/`%cd` cell before continuing;
+files in `/content` are temporary and a runtime restart can clear them. Confirm `torch.cuda.is_available()` is `True`.
 
 ```bash
 !pip install -r requirements.txt
 !python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')"
 ```
 
-Download and unpack the training archive:
+Mount Drive now so checkpoints and the final ZIP survive a Colab disconnect. Approve the Drive access prompt:
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+Download and unpack the training archive. The Hugging Face download command fetches the dataset files released so
+far. If a later phase archive is missing, rerun the download command after it is released:
 
 ```bash
 !pip install -U huggingface_hub
@@ -55,39 +64,29 @@ Download and unpack the training archive:
 ```
 
 Start with a smoke run, then launch the hybrid training command. Change `--batch-size 16` to `4` or `2` if needed.
+Training logs and best checkpoints go directly to Drive, so they persist across sessions.
 
 ```bash
 !python train.py --data cs701-sar-course-data --backbone vit --init pretrained --adapt hybrid \
   --backbone-lr 2e-5 --lr 1e-4 --select-class-gate --limit 64 --epochs 1 --workers 2 --out runs/smoke
 !python train.py --data cs701-sar-course-data --backbone vit --init pretrained --adapt hybrid \
-  --backbone-lr 2e-5 --lr 1e-4 --select-class-gate --batch-size 16 --workers 2 --out runs
+  --backbone-lr 2e-5 --lr 1e-4 --select-class-gate --batch-size 16 --workers 2 \
+  --out /content/drive/MyDrive/cs701-sar/runs
 ```
 
-Colab storage is temporary. Copy the best checkpoint to Google Drive before the session ends:
-
-```python
-from google.colab import drive
-drive.mount('/content/drive')
-```
-
-```bash
-!mkdir -p /content/drive/MyDrive/cs701-sar
-!cp runs/vit_pretrained_hybrid/best.pt /content/drive/MyDrive/cs701-sar/best.pt
-```
-
-After extracting the released validation or test archive into `cs701-sar-course-data`, predict with the saved
-checkpoint and copy the ZIP to Drive. For example, validation:
+Once the validation archive is available, download again to pick up the released file, extract it, and predict. The
+manifest and images must be under `cs701-sar-course-data/val/` (with `images.json` and `images/`). For validation:
 
 ```bash
 !tar -xzf cs701-sar-course-data/val.tar.gz -C cs701-sar-course-data
-!python predict.py --checkpoint /content/drive/MyDrive/cs701-sar/best.pt \
-  --data cs701-sar-course-data --split val --out submission_val.zip
-!cp submission_val.zip /content/drive/MyDrive/cs701-sar/submission_val.zip
+!python predict.py --checkpoint /content/drive/MyDrive/cs701-sar/runs/vit_pretrained_hybrid/best.pt \
+  --data cs701-sar-course-data --split val --out /content/drive/MyDrive/cs701-sar/submission_val.zip
 ```
 
-Use `--split test` and `submission_test.zip` during Phase 2. The `--train-all` option can fit a final model on all
-labeled training images after selecting an epoch count and class gate from the holdout run; save that `final.pt`
-checkpoint to Drive too.
+The resulting ZIP is in Drive and contains `classification.csv` and `detection.json`. Use `--split test`, the
+`test.tar.gz` archive, and an output name such as `submission_test.zip` during Phase 2. The holdout checkpoint is
+ready for validation inference; `--train-all` is an optional final-model step after choosing an epoch count and class
+gate from the holdout run.
 
 ## 1. SAR Task Introduction
 
