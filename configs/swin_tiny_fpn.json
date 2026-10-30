@@ -1,0 +1,13 @@
+{
+  "backbone": "swin_tiny",
+  "init": "pretrained",
+  "adapt": "partial",
+  "epochs": 24,
+  "batch_size": 8,
+  "lr": 0.0001,
+  "backbone_lr": 0.00002,
+  "weight_decay": 0.05,
+  "eval_every": 2,
+  "seed": 2026,
+  "val_fraction": 0.15
+}

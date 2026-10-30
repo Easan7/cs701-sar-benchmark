@@ -20,6 +20,7 @@ def classification_metrics(y_true, y_pred, num_classes=9):
         'accuracy': float(tp.sum() / cm.sum()),
         'macro_f1': float(f1.mean()),
         'balanced_accuracy': float(recall.mean()),
+        'per_class_F1': {str(i): float(value) for i, value in enumerate(f1)},
         'confusion_matrix': cm.tolist(),
     }
 

@@ -41,20 +41,59 @@ class MoELoRA(nn.Module):
         return self.base(x) + self.scale * self.up(self.down(x) * gates)
 
 
-def add_adapters(backbone, kind):
-    """Adapt attention, or train the last two blocks fully while applying LoRA to earlier blocks."""
+def add_adapters(backbone, kind, rank=16, alpha=32, unfreeze_blocks=2):
+    """Adapt attention, or fully tune the selected final blocks while adapting earlier blocks."""
+    if rank < 1 or alpha < 1 or unfreeze_blocks < 1:
+        raise ValueError('LoRA rank, alpha, and number of unfrozen blocks must be positive')
+    if kind == 'moelora' and rank < 4:
+        raise ValueError('MoE-LoRA rank must be at least 4')
+    if kind in {'frozen', 'partial'}:
+        backbone.requires_grad_(False)
+        if kind == 'partial':
+            blocks = backbone.blocks
+            for block in blocks[-unfreeze_blocks:]:
+                block.requires_grad_(True)
+            if hasattr(backbone, 'vit'):
+                backbone.vit.norm.requires_grad_(True)
+        return
     adapter = {'lora': LoRA, 'moelora': MoELoRA, 'hybrid': LoRA}[kind]
     backbone.requires_grad_(False)
     blocks = backbone.blocks
-    for blk in blocks[:-2] if kind == 'hybrid' else blocks:
-        blk.attn.qkv = adapter(blk.attn.qkv)
-        blk.attn.proj = adapter(blk.attn.proj)
+    for blk in blocks[:-unfreeze_blocks] if kind == 'hybrid' else blocks:
+        if kind == 'moelora':
+            blk.attn.qkv = MoELoRA(blk.attn.qkv, rank=max(1, rank // 4), alpha=alpha // 4)
+            blk.attn.proj = MoELoRA(blk.attn.proj, rank=max(1, rank // 4), alpha=alpha // 4)
+        else:
+            blk.attn.qkv = adapter(blk.attn.qkv, rank=rank, alpha=alpha)
+            blk.attn.proj = adapter(blk.attn.proj, rank=rank, alpha=alpha)
     if kind == 'hybrid':
-        for blk in blocks[-2:]:
+        for blk in blocks[-unfreeze_blocks:]:
             blk.requires_grad_(True)
         # The final token normalization also needs to track the changed representations.
         if hasattr(backbone, 'vit'):
             backbone.vit.norm.requires_grad_(True)
+
+
+def configure_adaptation(backbone, kind, rank=16, alpha=32, unfreeze_blocks=2):
+    """Apply a named adaptation strategy to transformer or hierarchical CNN backbones."""
+    if unfreeze_blocks < 1:
+        raise ValueError('unfreeze_blocks must be positive')
+    if hasattr(backbone, 'feature_channels'):
+        backbone.requires_grad_(False)
+        if kind == 'full':
+            backbone.requires_grad_(True)
+        elif kind == 'partial':
+            stages = backbone.blocks
+            for stage in list(stages)[-unfreeze_blocks:]:
+                stage.requires_grad_(True)
+        elif kind != 'frozen':
+            raise ValueError(f'{kind} adapters are transformer-only; use full, partial, or frozen for this backbone')
+        return
+    if kind == 'full':
+        return
+    if kind not in {'lora', 'moelora', 'hybrid', 'partial', 'frozen'}:
+        raise ValueError(f'Unsupported adaptation: {kind}')
+    add_adapters(backbone, kind, rank=rank, alpha=alpha, unfreeze_blocks=unfreeze_blocks)
 
 
 def set_task(module, task):

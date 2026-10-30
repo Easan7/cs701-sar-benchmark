@@ -1,0 +1,13 @@
+{
+  "backbone": "vit",
+  "init": "pretrained",
+  "adapt": "lora",
+  "epochs": 24,
+  "batch_size": 16,
+  "lr": 0.0001,
+  "backbone_lr": 0.0001,
+  "weight_decay": 0.05,
+  "eval_every": 2,
+  "seed": 2026,
+  "val_fraction": 0.15
+}

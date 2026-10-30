@@ -1,0 +1,21 @@
+{
+  "backbone": "vit",
+  "init": "pretrained",
+  "adapt": "hybrid",
+  "raw_pixel_branch": true,
+  "anchor_sizes": [[4, 8], [12, 20], [32, 48], [64, 96], [128, 192]],
+  "aspect_ratios": [0.5, 1.0, 2.0],
+  "roi_score_threshold": 0.05,
+  "roi_nms_threshold": 0.5,
+  "max_detections": 100,
+  "roi_hidden_dim": 1024,
+  "roi_pool_size": 7,
+  "epochs": 24,
+  "batch_size": 8,
+  "lr": 0.0001,
+  "backbone_lr": 0.00002,
+  "weight_decay": 0.05,
+  "eval_every": 2,
+  "seed": 2026,
+  "val_fraction": 0.15
+}

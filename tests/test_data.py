@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision import tv_tensors
 
-from sarbench.data import MEAN, STD, SARMultiTask, collate, to_original_xywh
+from sarbench.data import MEAN, STD, SARMultiTask, collate, to_original_xywh, _flip_boxes, _rot90_boxes
 from sarbench.metrics import detection_metrics
 
 ROOT = Path(__file__).resolve().parents[2] / 'dataset' / 'SARFact-Course-20K'
@@ -42,17 +42,10 @@ def test_ground_truth_round_trip_scores_map_1(split):
     assert [round(ap, 3) for ap in metrics['per_class_AP'].values()] == [1.0] * 9
 
 
-def test_flips_move_boxes_with_pixels():
-    transform = SARMultiTask(ROOT, 'train', train=True).transform
-    image = torch.zeros(1, 200, 300, dtype=torch.uint8)  # non-square, so the resize also stretches it
-    image[:, 50:90, 30:120] = 255  # a bright rectangle filling exactly this box:
-    box = tv_tensors.BoundingBoxes([[30., 50., 120., 90.]], format='XYXY', canvas_size=(200, 300))
-    flips = set()
-    for seed in range(8):
-        torch.manual_seed(seed)
-        out, out_box = transform(image, box)
-        ys, xs = torch.nonzero(out[0] * STD + MEAN > 0.5, as_tuple=True)
-        bright = torch.stack([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1])  # pixel i spans [i, i + 1)
-        assert torch.allclose(bright.float(), out_box[0], atol=1)
-        flips.add((out_box[0, 0].item() > 256, out_box[0, 1].item() > 256))  # (horizontal, vertical)
-    assert len(flips) == 4  # the seeds cover every combination of the two flips
+def test_exact_geometry_preserves_boxes_without_resizing():
+    box = torch.tensor([[30., 50., 120., 90.]])
+    assert torch.equal(_flip_boxes(box, 300, horizontal=True), torch.tensor([[180., 50., 270., 90.]]))
+    assert torch.equal(_flip_boxes(box, 200, horizontal=False), torch.tensor([[30., 110., 120., 150.]]))
+    assert torch.equal(_rot90_boxes(box, 200, 300, 1), torch.tensor([[50., 180., 90., 270.]]))
+    assert torch.equal(_rot90_boxes(box, 200, 300, 2), torch.tensor([[180., 110., 270., 150.]]))
+    assert torch.equal(to_original_xywh(box, (200, 300)), torch.tensor([[30., 50., 90., 40.]]))

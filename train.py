@@ -11,19 +11,23 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from sarbench.adapters import add_adapters
+from sarbench.adapters import configure_adaptation
 from sarbench.backbones import build_backbone
-from sarbench.data import SARMultiTask, collate, to_original_xywh
+from sarbench.data import SARMultiTask, collate, to_original_xywh, compute_training_statistics
 from sarbench.metrics import classification_metrics, detection_metrics
 from sarbench.model import MultiTaskModel
+from sarbench.compliance import validate_model_budget
+from sarbench.losses import combine_task_losses
+from sarbench.losses import UncertaintyTaskWeights
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--config', type=Path, help='JSON experiment configuration; explicit CLI flags override it')
     p.add_argument('--data', type=Path, default=Path(__file__).resolve().parent / 'cs701-sar-course-data')
-    p.add_argument('--backbone', required=True, choices=['vit', 'terramind'])
-    p.add_argument('--init', required=True, choices=['pretrained', 'scratch'])
-    p.add_argument('--adapt', required=True, choices=['full', 'lora', 'moelora', 'hybrid'])
+    p.add_argument('--backbone', choices=['vit', 'terramind', 'swin_tiny', 'resnet50', 'convnext_tiny'])
+    p.add_argument('--init', choices=['pretrained', 'scratch'])
+    p.add_argument('--adapt', choices=['full', 'lora', 'moelora', 'hybrid', 'partial', 'frozen'])
     p.add_argument('--epochs', type=int, default=24)
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--lr', type=float, default=1e-4)
@@ -34,6 +38,25 @@ def parse_args():
     p.add_argument('--limit', type=int, help='use only the first N labeled training images (quick checks)')
     p.add_argument('--val-fraction', type=float, default=0.1, help='fraction of labeled train images held out locally')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--raw-pixel-branch', action='store_true', help='fuse genuine input-pixel stride-4/8 features')
+    p.add_argument('--rotate90-prob', type=float, default=0.0)
+    p.add_argument('--gain-prob', type=float, default=0.0)
+    p.add_argument('--gamma-prob', type=float, default=0.0)
+    p.add_argument('--speckle-prob', type=float, default=0.0)
+    p.add_argument('--lora-rank', type=int, default=16)
+    p.add_argument('--lora-alpha', type=int, default=32)
+    p.add_argument('--unfreeze-blocks', type=int, default=2)
+    p.add_argument('--classification-loss-weight', type=float, default=1.0)
+    p.add_argument('--detection-loss-weight', type=float, default=1.0)
+    p.add_argument('--loss-weighting', choices=['fixed', 'uncertainty'], default='fixed')
+    p.add_argument('--anchor-sizes', type=json.loads,
+                   default=[[8, 11], [16, 23], [32, 45], [64, 91], [128, 181]])
+    p.add_argument('--aspect-ratios', type=json.loads, default=[0.5, 1.0, 2.0])
+    p.add_argument('--roi-score-threshold', type=float, default=0.05)
+    p.add_argument('--roi-nms-threshold', type=float, default=0.5)
+    p.add_argument('--max-detections', type=int, default=100)
+    p.add_argument('--roi-hidden-dim', type=int, default=1024)
+    p.add_argument('--roi-pool-size', type=int, default=7)
     p.add_argument('--out', type=Path, default=Path('runs'))
     p.add_argument('--select-class-gate', action='store_true',
                    help='compare detections restricted to the predicted image class on the train holdout')
@@ -43,7 +66,13 @@ def parse_args():
                    help='fit all labeled training images after selecting an epoch count on a holdout')
     p.add_argument('--class-gate', action='store_true',
                    help='store the selected class gate in a --train-all checkpoint')
+    preliminary, _ = p.parse_known_args()
+    if preliminary.config:
+        config = json.loads(preliminary.config.read_text())
+        p.set_defaults(**config)
     args = p.parse_args()
+    if not args.backbone or not args.init or not args.adapt:
+        p.error('provide --backbone, --init, and --adapt, directly or through --config')
     if args.init == 'scratch' and args.adapt != 'full':
         p.error('--init scratch is only valid with --adapt full')
     if args.backbone_lr is None:
@@ -57,9 +86,13 @@ def log(message, file):
     print(message, file=file, flush=True)
 
 
-def make_loader(args, indices, train):
+def make_loader(args, indices, train, mean, std):
     """Batches from labeled train; only the training subset is shuffled and augmented."""
-    dataset = SARMultiTask(args.data, 'train', train=train, limit=args.limit, indices=indices)
+    dataset = SARMultiTask(args.data, 'train', train=train, limit=args.limit, indices=indices,
+                           rotate90_prob=args.rotate90_prob if train else 0.0,
+                           gain_prob=args.gain_prob if train else 0.0,
+                           gamma_prob=args.gamma_prob if train else 0.0,
+                           speckle_prob=args.speckle_prob if train else 0.0, mean=mean, std=std)
     return DataLoader(dataset, args.batch_size, shuffle=train, num_workers=args.workers, collate_fn=collate,
                       persistent_workers=train and args.workers > 0)  # training workers live across epochs
 
@@ -71,36 +104,43 @@ def lr_factor(step, warmup, total):
     return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(total - warmup, 1)))  # --epochs 1: no decay phase
 
 
-def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file):
+def train_one_epoch(model, loader, optimizer, schedule, epoch, log_file, args, loss_weighter=None):
     """One pass over the training set; the loss is cross-entropy plus the four Faster R-CNN losses."""
     model.train()
     start, seen = time.time(), 0
     for step, (images, labels, targets) in enumerate(loader, 1):
-        targets = [{'boxes': t['boxes'].cuda(), 'labels': t['labels'].cuda()} for t in targets]
-        with torch.autocast('cuda', dtype=torch.bfloat16):  # bf16 has fp32's range: no loss scaling needed
+        targets = [{'boxes': t['boxes'].cuda(), 'labels': t['labels'].cuda(), 'input_size': t['input_size']}
+                   for t in targets]
+        with torch.autocast('cuda', dtype=args.amp_dtype):
             logits, _, det_losses = model(images.cuda(), targets)
-            losses = {'classification': F.cross_entropy(logits, labels.cuda()), **det_losses}
-        loss = sum(losses.values())
+            cls_loss = F.cross_entropy(logits, labels.cuda())
+            loss, detector_sum, effective_weights = combine_task_losses(
+                cls_loss, det_losses, args.classification_loss_weight, args.detection_loss_weight,
+                uncertainty=loss_weighter)
+            losses = {'classification': cls_loss, 'detection_total': detector_sum, **det_losses}
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        args.scaler.scale(loss).backward()
+        args.scaler.step(optimizer)
+        args.scaler.update()
         schedule.step()
         seen += len(images)
         if step % 50 == 0 or step == len(loader):
             parts = ' '.join(f'{name} {value.item():.3f}' for name, value in losses.items())
             log(f'epoch {epoch} iter {step}/{len(loader)} loss {loss.item():.3f} ({parts}) '
-                f'lr {optimizer.param_groups[1]["lr"]:.2e} {seen / (time.time() - start):.1f} images/s', log_file)
+                f'task_weights cls={effective_weights["classification"]:.3f} '
+                f'det={effective_weights["detection"]:.3f} lr {optimizer.param_groups[-1]["lr"]:.2e} '
+                f'{seen / (time.time() - start):.1f} images/s', log_file)
             start, seen = time.time(), 0
 
 
 @torch.no_grad()
-def evaluate(model, loader, gt_json, class_gate=False):
+def evaluate(model, loader, gt_json, class_gate=False, amp_dtype=torch.bfloat16):
     """Classification and COCO detection metrics on one split, and the detections in COCO result format."""
     model.eval()
     labels, predicted, detections, image_ids = [], [], [], []
     for images, y, targets in loader:
-        with torch.autocast('cuda', dtype=torch.bfloat16):
-            logits, outputs, _ = model(images.cuda())
+        with torch.autocast('cuda', dtype=amp_dtype):
+            logits, outputs, _ = model(images.cuda(), image_sizes=[t['orig_size'] for t in targets])
         labels += y.tolist()
         batch_classes = logits.argmax(dim=1).tolist()
         predicted += batch_classes
@@ -126,8 +166,11 @@ def main():
         raise ValueError('--val-fraction must be between 0 and 1')
     if args.train_all and args.select_class_gate:
         raise ValueError('--select-class-gate needs a holdout; use --class-gate with --train-all')
+    args.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    args.scaler = torch.amp.GradScaler('cuda', enabled=args.amp_dtype == torch.float16)
     torch.manual_seed(args.seed)
-    run_dir = args.out / f'{args.backbone}_{args.init}_{args.adapt}{"_all" if args.train_all else ""}'
+    run_name = args.config.stem if args.config else f'{args.backbone}_{args.init}_{args.adapt}'
+    run_dir = args.out / f'{run_name}{"_all" if args.train_all else ""}'
     run_dir.mkdir(parents=True, exist_ok=True)
     log_file = open(run_dir / 'log.txt', 'w')
     log(json.dumps(vars(args), default=str), log_file)
@@ -147,9 +190,10 @@ def main():
             n_val = max(1, round(len(indices) * args.val_fraction)) if len(indices) > 1 else 0
             val_indices.extend(indices[:n_val])
             train_indices.extend(indices[n_val:])
-    train_loader = make_loader(args, train_indices, True)
+    mean, std = compute_training_statistics(args.data, all_data.rows, train_indices)
+    train_loader = make_loader(args, train_indices, True, mean, std)
     if not args.train_all:
-        val_loader = make_loader(args, val_indices, False)
+        val_loader = make_loader(args, val_indices, False, mean, std)
         val_rows = [all_data.rows[i] for i in val_indices]
         val_ids = {all_data.coco_images[row['file_name']]['id'] for row in val_rows}
         val_gt = {**all_data.coco, 'images': [im for im in all_data.coco['images'] if im['id'] in val_ids],
@@ -157,11 +201,25 @@ def main():
 
     # Model: adapters are created on the CPU, so they are added before .cuda()
     backbone = build_backbone(args.backbone, pretrained=args.init == 'pretrained')
-    if args.adapt != 'full':
-        add_adapters(backbone, args.adapt)  # also freezes the backbone
-    model = MultiTaskModel(backbone, task_routing=args.adapt == 'moelora').cuda()
-    parameters = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    configure_adaptation(backbone, args.adapt, rank=args.lora_rank, alpha=args.lora_alpha,
+                         unfreeze_blocks=args.unfreeze_blocks)
+    model = MultiTaskModel(backbone, task_routing=args.adapt == 'moelora',
+                           raw_pixel_branch=args.raw_pixel_branch,
+                           anchor_sizes=args.anchor_sizes, aspect_ratios=args.aspect_ratios,
+                           roi_score_threshold=args.roi_score_threshold,
+                           roi_nms_threshold=args.roi_nms_threshold, max_detections=args.max_detections,
+                           roi_hidden_dim=args.roi_hidden_dim, roi_pool_size=args.roi_pool_size).cuda()
+    loss_weighter = UncertaintyTaskWeights().cuda() if args.loss_weighting == 'uncertainty' else None
+    counts = validate_model_budget(model) if not args.allow_over_budget_reference else {
+        'total': sum(p.numel() for p in model.parameters()),
+        'trainable': sum(p.numel() for p in model.parameters() if p.requires_grad)}
+    parameters, trainable = counts['total'], counts['trainable']
+    if loss_weighter is not None:
+        parameters += sum(p.numel() for p in loss_weighter.parameters())
+        trainable += sum(p.numel() for p in loss_weighter.parameters() if p.requires_grad)
+        if ((parameters > 130_000_000 or trainable > 40_000_000)
+                and not args.allow_over_budget_reference):
+            raise ValueError(f'Assignment parameter budget exceeded: {parameters:,} total, {trainable:,} trainable')
     log(f'parameters: {parameters:,} total, {trainable:,} trainable', log_file)
     if (parameters > 130_000_000 or trainable > 40_000_000) and not args.allow_over_budget_reference:
         raise ValueError(f'Assignment parameter budget exceeded: {parameters:,} total, {trainable:,} trainable')
@@ -169,18 +227,25 @@ def main():
     # Optimizer and schedule: trainable backbone parameters at --backbone-lr, all new modules at --lr
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
     head_params = [p for name, p in model.named_parameters() if not name.startswith('backbone.')]
-    optimizer = torch.optim.AdamW([{'params': backbone_params, 'lr': args.backbone_lr}, {'params': head_params}],
-                                  lr=args.lr, weight_decay=args.weight_decay)
+    if loss_weighter is not None:
+        head_params += list(loss_weighter.parameters())
+    parameter_groups = []
+    if backbone_params:
+        parameter_groups.append({'params': backbone_params, 'lr': args.backbone_lr})
+    if head_params:
+        parameter_groups.append({'params': head_params, 'lr': args.lr})
+    optimizer = torch.optim.AdamW(parameter_groups, lr=args.lr, weight_decay=args.weight_decay)
     warmup, total = len(train_loader), args.epochs * len(train_loader)  # one epoch of warmup
     schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_factor(step, warmup, total))
 
-    # Train, validating every --eval-every epochs; the reported model is the last-epoch model
+    # Train, validating every --eval-every epochs and selecting the best local validation checkpoint.
     history, start, best_score = [], time.time(), -float('inf')
     for epoch in range(1, args.epochs + 1):
-        train_one_epoch(model, train_loader, optimizer, schedule, epoch, log_file)
+        train_one_epoch(model, train_loader, optimizer, schedule, epoch, log_file, args, loss_weighter)
         if not args.train_all and (epoch % args.eval_every == 0 or epoch == args.epochs):
             choices = [False, True] if args.select_class_gate else [False]
-            candidates = [(*evaluate(model, val_loader, val_gt, class_gate=gate), gate) for gate in choices]
+            candidates = [(*evaluate(model, val_loader, val_gt, class_gate=gate,
+                                     amp_dtype=args.amp_dtype), gate) for gate in choices]
             val, val_detections, gate = max(
                 candidates, key=lambda x: 0.5 * (x[0]['macro_f1'] / 0.9331 + x[0]['mAP'] / 0.2613))
             score = 50 * (val['macro_f1'] / 0.9331 + val['mAP'] / 0.2613 - 2)
@@ -189,6 +254,14 @@ def main():
             if score > best_score:
                 best_score = score
                 torch.save({'model': model.state_dict(), 'backbone': args.backbone, 'adapt': args.adapt,
+                            'lora_rank': args.lora_rank, 'lora_alpha': args.lora_alpha,
+                            'unfreeze_blocks': args.unfreeze_blocks,
+                            'raw_pixel_branch': args.raw_pixel_branch,
+                            'detector_config': {key: getattr(args, key) for key in (
+                                'anchor_sizes', 'aspect_ratios', 'roi_score_threshold', 'roi_nms_threshold',
+                                'max_detections', 'roi_hidden_dim', 'roi_pool_size')},
+                            'loss_weighter': loss_weighter.state_dict() if loss_weighter is not None else None,
+                            'mean': mean, 'std': std,
                             'class_gate': gate, 'epoch': epoch, 'val': val}, run_dir / 'best.pt')
                 (run_dir / 'predictions_val.json').write_text(json.dumps(val_detections))
     train_hours = (time.time() - start) / 3600
@@ -203,6 +276,14 @@ def main():
     (run_dir / 'metrics.json').write_text(json.dumps(summary, indent=2, default=str))
     if args.train_all:
         torch.save({'model': model.state_dict(), 'backbone': args.backbone, 'adapt': args.adapt,
+                    'lora_rank': args.lora_rank, 'lora_alpha': args.lora_alpha,
+                    'unfreeze_blocks': args.unfreeze_blocks,
+                    'raw_pixel_branch': args.raw_pixel_branch,
+                    'detector_config': {key: getattr(args, key) for key in (
+                        'anchor_sizes', 'aspect_ratios', 'roi_score_threshold', 'roi_nms_threshold',
+                        'max_detections', 'roi_hidden_dim', 'roi_pool_size')},
+                    'loss_weighter': loss_weighter.state_dict() if loss_weighter is not None else None,
+                    'mean': mean, 'std': std,
                     'class_gate': args.class_gate, 'epoch': args.epochs}, run_dir / 'final.pt')
         log(f'final checkpoint: epoch {args.epochs}', log_file)
     else:

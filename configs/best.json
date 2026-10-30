@@ -1,0 +1,23 @@
+{
+  "backbone": "vit",
+  "init": "pretrained",
+  "adapt": "hybrid",
+  "raw_pixel_branch": true,
+  "epochs": 24,
+  "batch_size": 8,
+  "lr": 0.0001,
+  "backbone_lr": 0.00002,
+  "weight_decay": 0.05,
+  "eval_every": 2,
+  "seed": 2026,
+  "val_fraction": 0.15,
+  "lora_rank": 8,
+  "lora_alpha": 16,
+  "unfreeze_blocks": 1,
+  "rotate90_prob": 0.5,
+  "gain_prob": 0.3,
+  "gamma_prob": 0.0,
+  "speckle_prob": 0.0,
+  "classification_loss_weight": 0.5,
+  "detection_loss_weight": 1.0
+}

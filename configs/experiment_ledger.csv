@@ -1,0 +1,1 @@
+run_id,config,git_sha,split_hash,seed,gpu_hours,total_params,trainable_params,macro_f1,map,ap50,ap75,apsmall,notes

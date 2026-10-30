@@ -9,9 +9,16 @@ from sarbench.adapters import MoELoRA, add_adapters
 from sarbench.backbones import build_backbone
 from sarbench.data import SARMultiTask, collate, to_original_xywh
 from sarbench.metrics import detection_metrics
-from sarbench.model import MultiTaskModel
+from sarbench.model import MultiTaskModel, RawPixelPyramid
 
 ROOT = Path(__file__).resolve().parents[2] / 'dataset' / 'SARFact-Course-20K'
+
+
+def test_raw_pixel_branch_exposes_stride_four_and_stride_eight_maps():
+    branch = RawPixelPyramid()
+    maps = branch(torch.randn(2, 1, 512, 512))
+    assert maps['0'].shape == (2, 256, 128, 128)
+    assert maps['1'].shape == (2, 256, 64, 64)
 
 
 def first_train_images(n):

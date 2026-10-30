@@ -1,6 +1,5 @@
 """The two ViT-B/16 backbones, built for 512 px input: images [B, 1, 512, 512] -> patch tokens [B, 1024, 768]."""
 import timm
-from terratorch.registry import BACKBONE_REGISTRY
 from torch import nn
 
 
@@ -28,6 +27,10 @@ class TerraMind(nn.Module):
 
     def __init__(self, pretrained: bool):
         super().__init__()
+        # Import TerraTorch only when this backbone is selected. Its registry imports
+        # optional packages (including audio dependencies) that ViT runs do not need.
+        from terratorch.registry import BACKBONE_REGISTRY
+
         self.terramind = BACKBONE_REGISTRY.build('terratorch_terramind_v1_base', pretrained=pretrained,
                                                  modalities=['S1GRD'])
         self.embed_dim = 768
@@ -42,5 +45,39 @@ class TerraMind(nn.Module):
 
 
 def build_backbone(name, pretrained):
-    """name: 'vit' or 'terramind'. pretrained=False builds the same architecture with random weights."""
-    return {'vit': ViT, 'terramind': TerraMind}[name](pretrained)
+    """Build a supported backbone. Generic ImageNet initialization is requested only at future run time."""
+    if name in {'vit', 'terramind'}:
+        return {'vit': ViT, 'terramind': TerraMind}[name](pretrained)
+    timm_names = {
+        'swin_tiny': ('swin_tiny_patch4_window7_224', (0, 1, 2, 3)),
+        'resnet50': ('resnet50', (1, 2, 3, 4)),
+        'convnext_tiny': ('convnext_tiny', (0, 1, 2, 3)),
+    }
+    if name not in timm_names:
+        raise ValueError(f'Unknown backbone {name!r}; choose one of {sorted(set(timm_names) | {"vit", "terramind"})}')
+    model_name, indices = timm_names[name]
+    return TimmFeatureBackbone(model_name, indices, pretrained)
+
+
+class TimmFeatureBackbone(nn.Module):
+    """Hierarchical generic-image backbone exposing native multiscale feature maps."""
+
+    def __init__(self, model_name, out_indices, pretrained):
+        super().__init__()
+        self.model = timm.create_model(model_name, pretrained=pretrained, features_only=True,
+                                       in_chans=1, out_indices=out_indices)
+        self.feature_channels = self.model.feature_info.channels()
+        self.embed_dim = self.feature_channels[-1]
+
+    @property
+    def blocks(self):
+        # Kept for interface compatibility; hierarchical models are tuned by freezing stages instead.
+        stages = getattr(self.model, 'layers', None) or getattr(self.model, 'stages', None)
+        if stages is not None:
+            return stages
+        named = [(name, module) for name, module in self.model.named_children()
+                 if name.startswith(('layer', 'stage'))]
+        return nn.ModuleList([module for _, module in named])
+
+    def forward(self, x):
+        return self.model(x)
