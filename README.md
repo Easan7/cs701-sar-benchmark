@@ -33,7 +33,7 @@ L4 or A100 is preferable. On a 16 GB T4, lower `--batch-size` to 4 or 2 if you r
 Run these cells in order in a new notebook. The clone command gets the branch you pushed above:
 
 ```bash
-!git clone https://github.com/doem97/cs701-sar-benchmark.git
+!git clone https://github.com/Easan7/cs701-sar-benchmark.git
 %cd /content/cs701-sar-benchmark
 !nvidia-smi
 ```
@@ -63,19 +63,33 @@ far. If a later phase archive is missing, rerun the download command after it is
 !tar -xzf cs701-sar-course-data/train.tar.gz -C cs701-sar-course-data
 ```
 
-Start with a smoke run, then launch the hybrid training command. Change `--batch-size 16` to `4` or `2` if needed.
-Training logs and best checkpoints go directly to Drive, so they persist across sessions.
+Start with a smoke run to check that the data and model load correctly. Then launch the full hybrid training run.
+It holds out a class-stratified 10% of the labeled training data and evaluates on that holdout every epoch;
+`--eval-every 1` makes the cadence explicit (the default is every 4 epochs and at the end). These are local
+validation metrics, so you can inspect model quality before creating a submission. Change `--batch-size 16` to `4`
+or `2` if the T4 runs out of memory. Training logs, metrics, and the best checkpoint go directly to Drive.
 
 ```bash
+%cd /content/cs701-sar-benchmark
 !python train.py --data cs701-sar-course-data --backbone vit --init pretrained --adapt hybrid \
-  --backbone-lr 2e-5 --lr 1e-4 --select-class-gate --limit 64 --epochs 1 --workers 2 --out runs/smoke
+  --backbone-lr 2e-5 --lr 1e-4 --select-class-gate --limit 64 --epochs 1 --workers 2 \
+  --out /content/drive/MyDrive/cs701-sar/smoke
 !python train.py --data cs701-sar-course-data --backbone vit --init pretrained --adapt hybrid \
-  --backbone-lr 2e-5 --lr 1e-4 --select-class-gate --batch-size 16 --workers 2 \
+  --backbone-lr 2e-5 --lr 1e-4 --select-class-gate --batch-size 16 --eval-every 1 --workers 2 \
   --out /content/drive/MyDrive/cs701-sar/runs
 ```
 
-Once the validation archive is available, download again to pick up the released file, extract it, and predict. The
-manifest and images must be under `cs701-sar-course-data/val/` (with `images.json` and `images/`). For validation:
+While training runs, losses appear in the cell output. At each evaluation, the holdout scores (accuracy, macro-F1,
+mAP, AP50, and `delta_m_proxy`) appear there too. The project guidelines rank models by Δm, the mean relative gain
+in macro-F1 and mAP over the reference. This run's `delta_m_proxy` is a local estimate using the reference values.
+You can inspect the full evaluation history and best epoch in Drive at
+`cs701-sar/runs/vit_pretrained_hybrid/metrics.json`; `log.txt` has the readable progress log, and
+`predictions_val.json` contains holdout detections. Use these holdout results to choose the epoch and whether to use
+the class gate. You do not need to run prediction just to see training validation metrics.
+
+The course validation and test labels are withheld. After choosing a model, you can make a ZIP for the leaderboard
+using the released images. For Phase 1 validation, download the released archive, extract it, and predict; the
+manifest and images must be under `cs701-sar-course-data/val/` (with `images.json` and `images/`):
 
 ```bash
 !tar -xzf cs701-sar-course-data/val.tar.gz -C cs701-sar-course-data
@@ -85,8 +99,8 @@ manifest and images must be under `cs701-sar-course-data/val/` (with `images.jso
 
 The resulting ZIP is in Drive and contains `classification.csv` and `detection.json`. Use `--split test`, the
 `test.tar.gz` archive, and an output name such as `submission_test.zip` during Phase 2. The holdout checkpoint is
-ready for validation inference; `--train-all` is an optional final-model step after choosing an epoch count and class
-gate from the holdout run.
+ready for inference. Alternatively, after choosing an epoch count and class gate from the holdout run, use
+`--train-all` to fit the final model on all labeled training images before prediction.
 
 ## 1. SAR Task Introduction
 
@@ -286,3 +300,11 @@ More: [docs/DETAILS.md](docs/DETAILS.md).
 - Data: https://huggingface.co/datasets/doem1997/cs701-sar-course-data
 - Leaderboard: https://www.codabench.org/competitions/18271
 - Questions: TA Zichen, zichen.tian.2023@phdcs.smu.edu.sg
+
+## 6. Research-driven implementation options
+
+The repository includes native-resolution padded preprocessing, optional SAR-aware augmentations, a raw-pixel P2/P3
+fusion branch, configurable task weighting, and ViT, TerraMind, Swin-Tiny, ResNet-50, and ConvNeXt-Tiny backbone
+configurations. See [the implementation guide](docs/IMPLEMENTATION_GUIDE.md) for architecture status, Colab commands,
+assignment constraints, and unverified items. The `best` configuration is a research-informed starting hypothesis;
+it has not been measured on the course holdout.
